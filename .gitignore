@@ -1,0 +1,19 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Watch/output directories
+watch/
+completed/
+problem/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
