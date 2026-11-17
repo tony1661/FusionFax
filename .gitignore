@@ -1,19 +1,16 @@
-# Environment / secrets
-.env
+# Real API keys - never commit
+config.ini
+config.ini.bak
+customers/
+packages/
 
-# Python
+# Build output
+build/
+dist/
+*.spec
 __pycache__/
-*.py[cod]
-*.pyo
+venv/
 
-# Watch/output directories
-watch/
-completed/
-problem/
-
-# Logs
+# Logs and debug output (may contain server details or patient numbers)
 *.log
-
-# OS
-.DS_Store
-Thumbs.db
+debug_page.html
