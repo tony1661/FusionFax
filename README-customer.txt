@@ -24,6 +24,9 @@ Within a few seconds the file moves to:
     Documents\FaxSend\Sent      - the fax was handed to the fax server
     Documents\FaxSend\Failed    - there was a problem (see below)
 
+If the PDF is still open (for example in Adobe), FaxSend waits and sends it
+as soon as you close it. Faxes being sent appear briefly in Outbox\Sending.
+
 If the internet or phone system is down, faxes wait in the Outbox and go out
 automatically when the connection is back.
 

@@ -21,6 +21,7 @@ Command line:
 """
 import base64
 import configparser
+import errno
 import json
 import logging
 import os
@@ -571,6 +572,26 @@ def single_instance():
     return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
 
 
+def try_move(src, folder):
+    """Move src into folder. Returns the new path, or None if it could not be moved
+    (on Windows: the file is open in another program, such as Adobe Reader)."""
+    dest = unique_dest(folder, os.path.basename(src))
+    try:
+        os.replace(src, dest)  # a rename: fails at once if the file is open
+        return dest
+    except OSError as e:
+        if getattr(e, "winerror", None) != 17 and e.errno != errno.EXDEV:
+            return None
+    try:  # folder is on another drive: copy, then delete the original
+        shutil.copy2(src, dest)
+        os.remove(src)
+        return dest
+    except OSError:
+        if os.path.exists(src) and os.path.exists(dest):
+            os.remove(dest)  # original still there - don't leave a duplicate
+        return None
+
+
 def run_watcher():
     cfg = load_config()
     ensure_folders({key: cfg["folders"][key] for key in FOLDER_NAMES})
@@ -587,52 +608,98 @@ def run_watcher():
     settle = cfg.getfloat("options", "settle_seconds", fallback=3)
     retries = cfg.getint("options", "retries", fallback=2)
 
+    # A fax is moved from the Outbox into Outbox\Sending BEFORE it is sent. If the
+    # PDF is open in another program, Windows refuses the move, so the fax waits in
+    # the Outbox untouched instead of being sent again and again.
+    sending = os.path.join(watch, "Sending")
+    os.makedirs(sending, exist_ok=True)
+    for name in sorted(os.listdir(sending)):
+        path = os.path.join(sending, name)
+        if os.path.isfile(path):
+            detail = ("FaxSend stopped while this fax was being sent - check log.txt and the "
+                      "fax server before sending it again")
+            logging.warning("Left over in Sending: %s", name)
+            fax_log(logs, "FAILED", name, (NAME_RE.match(name) or [None, None])[1], detail)
+            if not try_move(path, failed):
+                logging.error("Could not move %s out of Sending", name)
+
+    pending = {}      # path in Sending -> folder it still has to go to
+    open_files = set()  # Outbox files already reported as open
     logging.info("Watching %s (method: %s)", watch, method)
     offline_since = None
     while True:
         try:
-            for name in sorted(os.listdir(watch)):
+            # files that were sent/failed but could not be moved out of Sending yet
+            for path, folder in list(pending.items()):
+                if not os.path.exists(path) or try_move(path, folder):
+                    del pending[path]
+
+            names = sorted(os.listdir(watch))
+            open_files &= set(names)
+            for name in names:
                 path = os.path.join(watch, name)
                 if not os.path.isfile(path) or not name.lower().endswith(".pdf"):
                     continue
                 m = NAME_RE.match(name)
                 if not m:
-                    logging.warning("Bad filename (need 10 digit number): %s", name)
-                    fax_log(logs, "FAILED", name, None, "Bad filename - must start with a 10 digit number")
-                    shutil.move(path, unique_dest(failed, name))
+                    if try_move(path, failed):
+                        logging.warning("Bad filename (need 10 digit number): %s", name)
+                        fax_log(logs, "FAILED", name, None, "Bad filename - must start with a 10 digit number")
+                        open_files.discard(name)
+                    elif name not in open_files:
+                        open_files.add(name)
+                        logging.warning("Bad filename and open in another program: %s", name)
                     continue
                 if not is_settled(path, settle):
                     continue
                 number = m.group(1)
+                work = try_move(path, sending)
+                if not work:
+                    if os.path.exists(path) and name not in open_files:
+                        open_files.add(name)
+                        logging.warning("%s is open in another program - waiting until it is closed", name)
+                        fax_log(logs, "WAIT", name, number,
+                                "File is open in another program (e.g. Adobe) - close it and it will be sent")
+                    continue
+                open_files.discard(name)
                 ok = False
                 last_error = ""
-                for attempt in range(1, retries + 2):
-                    try:
-                        client.send(path, number)
-                        ok = True
-                        break
-                    except SendUnconfirmed as e:
-                        last_error = f"UNCONFIRMED, not retried: {e}"
-                        logging.error("Send %s: %s", name, last_error)
-                        break
-                    except (ServerUnreachable, requests.exceptions.ConnectionError):
-                        raise  # leave the fax in the Outbox; handled below
-                    except Exception as e:
-                        last_error = str(e)
-                        logging.error("Send %s attempt %d failed: %s", name, attempt, e)
-                        time.sleep(5)
+                try:
+                    for attempt in range(1, retries + 2):
+                        try:
+                            client.send(work, number)
+                            ok = True
+                            break
+                        except SendUnconfirmed as e:
+                            last_error = f"UNCONFIRMED, not retried: {e}"
+                            logging.error("Send %s: %s", name, last_error)
+                            break
+                        except (ServerUnreachable, requests.exceptions.ConnectionError):
+                            raise
+                        except Exception as e:
+                            last_error = str(e)
+                            logging.error("Send %s attempt %d failed: %s", name, attempt, e)
+                            time.sleep(5)
+                except (ServerUnreachable, requests.exceptions.ConnectionError):
+                    # not sent: put it back in the Outbox to try again later
+                    if not try_move(work, watch):
+                        pending[work] = watch
+                    raise
                 if offline_since:
                     logging.info("Server reachable again")
                     offline_since = None
                 if ok:
                     logging.info("Sent %s to %s", name, number)
                     fax_log(logs, "SENT", name, number)
-                    shutil.move(path, unique_dest(sent, name))
+                    dest = sent
                 else:
                     fax_log(logs, "FAILED", name, number,
                             last_error if last_error.startswith("UNCONFIRMED")
                             else f"{retries + 1} attempts - {last_error}")
-                    shutil.move(path, unique_dest(failed, name))
+                    dest = failed
+                if not try_move(work, dest):
+                    logging.warning("Could not move %s to %s yet - will keep trying", name, dest)
+                    pending[work] = dest
         except (ServerUnreachable, requests.exceptions.ConnectionError) as e:
             if not offline_since:
                 offline_since = time.time()

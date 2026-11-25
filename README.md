@@ -23,6 +23,9 @@ Inside the program, and in the folders it creates on the PC, it is called
 4. The file moves to `Sent` or `Failed`, and a line is added to
    `Logs\log.txt` with the time, number and result.
 
+If the PDF is still open in another program, such as Adobe Reader, it waits in
+the Outbox and is sent once, as soon as it's closed.
+
 If the server can't be reached, faxes wait in the Outbox and are sent
 automatically when the connection is back.
 
